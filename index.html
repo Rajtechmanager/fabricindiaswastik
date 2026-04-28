@@ -11,8 +11,9 @@
     />
     <!-- Firebase SDKs -->
     <script type="module">
-      import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-      import { getFirestore, collection, getDocs, doc, setDoc, onSnapshot, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+      import { getFirestore, doc, getDoc, setDoc, collection, addDoc, getDocs, onSnapshot, query, orderBy } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+      import { getStorage, ref, uploadString, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 
       const firebaseConfig = {
         apiKey: "AIzaSyAK8eq7bW86BTUKX8SwPuk0_HqEn5cHLPg",
@@ -20,32 +21,16 @@
         projectId: "fabric-84971",
         storageBucket: "fabric-84971.firebasestorage.app",
         messagingSenderId: "341915371070",
-        appId: "1:341915371070:web:959ec924969ce0eb15f36f"
+        appId: "1:341915371070:web:a8af52c83657833b15f36f"
       };
 
       const app = initializeApp(firebaseConfig);
       const db = getFirestore(app);
+      const storage = getStorage(app);
 
-      // Expose to global scope
-      window._fbMain = { db, collection, getDocs, doc, setDoc, onSnapshot, getDoc };
-
-      // Load data on start and watch for realtime changes
-      window.addEventListener('DOMContentLoaded', () => {
-        // Realtime listener for fabrics
-        onSnapshot(collection(db, 'fabrics'), (snap) => {
-          const fabrics = [];
-          snap.forEach(d => fabrics.push({ id: d.id, ...d.data() }));
-          fabrics.sort((a,b) => (b.updatedAt||'').localeCompare(a.updatedAt||''));
-          window._fbFabrics = fabrics.filter(f => f.status !== 'draft');
-          if (typeof renderFabrics === 'function') renderFabrics();
-        });
-
-        // Realtime listener for pricing
-        onSnapshot(doc(db, 'settings', 'pricing'), (snap) => {
-          window._fbPricing = snap.exists() ? snap.data() : {};
-          if (typeof renderFabrics === 'function') renderFabrics();
-        });
-      });
+      window._fb = { db, storage, doc, getDoc, setDoc, collection, addDoc, getDocs, onSnapshot, query, orderBy, ref, uploadString, getDownloadURL };
+      window._fbReady = true;
+      window.dispatchEvent(new Event('fbReady'));
     </script>
     <style>
       :root {
@@ -1959,7 +1944,7 @@
                   <div class="upload-icon">🖼️</div>
                   <h4>Drop your design here</h4>
                   <p>
-                    Supports JPG, PNG, WEBP, GIF<br />Your uploaded design will
+                    Supports JPG, PNG, WEBP, GIF &bull; Max 5 MB<br />Your uploaded design will
                     be applied to all 4 fabric mockups instantly
                   </p>
                   <span class="upload-browse">Browse File</span>
@@ -3000,21 +2985,78 @@
         return "SE-" + Date.now().toString(36).toUpperCase();
       }
 
-      // ─── PRICING FROM ADMIN ───
-      function getPricing() {
-        return window._fbPricing || {};
+      // ─── FIREBASE DATA HELPERS ───
+      let _pricingCache = {};
+      let _fabricsCache = [];
+
+      function onFbReady(cb) {
+        if (window._fbReady) { cb(); return; }
+        window.addEventListener('fbReady', cb, { once: true });
       }
 
-      function getFabrics() {
-        return window._fbFabrics || [];
+      async function getPricing() {
+        try {
+          const { db, doc, getDoc } = window._fb;
+          const snap = await getDoc(doc(db, 'settings', 'pricing'));
+          _pricingCache = snap.exists() ? (snap.data().data || {}) : {};
+          return _pricingCache;
+        } catch(e) { return _pricingCache; }
+      }
+
+      async function getFabrics() {
+        try {
+          const { db, collection, getDocs, query, orderBy } = window._fb;
+          const snap = await getDocs(query(collection(db, 'fabrics'), orderBy('updatedAt', 'desc')));
+          _fabricsCache = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => f.status === 'live');
+          return _fabricsCache;
+        } catch(e) { return _fabricsCache; }
+      }
+
+      async function uploadDesignImage(dataUrl, enquiryId) {
+        try {
+          const { storage, ref, uploadString, getDownloadURL } = window._fb;
+          const imgRef = ref(storage, `enquiries/${enquiryId}/design`);
+          const snap = await uploadString(imgRef, dataUrl, 'data_url');
+          return await getDownloadURL(snap.ref);
+        } catch(e) { console.error('image upload failed', e); return null; }
+      }
+
+      // Wraps any promise with a timeout so buttons never spin forever
+      function withTimeout(promise, ms = 10000) {
+        return Promise.race([
+          promise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), ms))
+        ]);
+      }
+
+      async function saveEnquiry(queryObj, designImageSrc) {
+        const { db, doc, setDoc } = window._fb;
+
+        // Strip ALL image data - never store base64 in Firestore (causes doc > 1MB = silent fail)
+        // We flag that an image was provided; admin follows up via phone/WhatsApp
+        const safeObj = { ...queryObj };
+        Object.keys(safeObj).forEach(k => {
+          if (typeof safeObj[k] === 'string' && safeObj[k].startsWith('data:')) {
+            delete safeObj[k];
+          }
+        });
+
+        const data = {
+          ...safeObj,
+          hasDesignImage: !!designImageSrc,
+          designImageUrl: null,
+        };
+
+        await withTimeout(setDoc(doc(db, 'enquiries', queryObj.id), data));
+        return data;
       }
 
       // ─── RENDER FABRICS ───
       let currentFabric = null;
       let activePanelId = null;
 
-      function renderFabrics() {
-        const fabrics = getFabrics();
+      async function renderFabrics() {
+        const fabrics = await getFabrics();
         const grid = document.getElementById("fabricGrid");
 
         if (fabrics.length === 0) {
@@ -3022,7 +3064,7 @@
           return;
         }
 
-        const pricing = getPricing();
+        const pricing = await getPricing();
         const allFabricTypes = ["Cotton","Silk","Polyester","Georgette","Linen","Rayon","Chiffon","Satin"];
         const allPrintTypes = ["Rotary Print","Digital Print","Foil Print","Plain Dyed","Screen Print"];
 
@@ -3320,7 +3362,7 @@
         const fabric = document.getElementById("pn-fabric-" + id).value;
         const print = document.getElementById("pn-print-" + id).value;
         const qty = parseFloat(document.getElementById("pn-qty-" + id).value) || 0;
-        const pricing = getPricing();
+        const pricing = _pricingCache;
         const rate = pricing[print+':'+fabric] || pricing[print+':all'] || pricing[print];
         const box = document.getElementById("ppb-" + id);
 
@@ -3343,7 +3385,7 @@
         panelProposeCalc(id);
       }
 
-      function submitPanelQuote(id) {
+      async function submitPanelQuote(id) {
         const name = (document.getElementById("pn-name-" + id).value || "").trim();
         const phone = (document.getElementById("pn-phone-" + id).value || "").trim();
         const fabric = document.getElementById("pn-fabric-" + id).value;
@@ -3360,59 +3402,44 @@
         if (!print) { showToast("Please select a print type", "error"); return; }
         if (!qty || qty < 1) { showToast("Please enter quantity (minimum 1 meter)", "error"); return; }
 
-        const fabrics = getFabrics();
+        const fabrics = _fabricsCache;
         const thisFabric = fabrics.find(f => f.id === id);
-        const pricing = getPricing();
-        const rate = pricing[print] || null;
+        const pricing = _pricingCache;
+        const rate = pricing[print+':'+fabric] || pricing[print+':all'] || pricing[print] || null;
 
-        const query = {
+        const queryObj = {
           id: genRef(),
           type: "collection-quote",
           timestamp: new Date().toISOString(),
           collectionId: id,
           collectionName: thisFabric ? thisFabric.name : "N/A",
-          collectionImage: thisFabric ? thisFabric.image : null,
+          collectionImage: null, // Do NOT store base64 image in Firestore (exceeds 1MB doc limit)
           fabricType: fabric,
           printType: print,
           qty: qty,
           ratePerMeter: rate,
           totalEstimate: rate ? rate * qty : null,
           proposedPrice: propose ? parseFloat(propose) : null,
-          customerUploadedDesign: uploadedDesign ? "[customer uploaded design]" : null,
           hasCustomDesign: !!uploadedDesign,
           name, phone, email,
           status: "pending",
         };
 
-        // Store image separately to keep query lean (store URL if available)
-        const query = {
-          id: genRef(),
-          type: "collection-quote",
-          timestamp: new Date().toISOString(),
-          collectionId: id,
-          collectionName: thisFabric ? thisFabric.name : "N/A",
-          collectionImage: thisFabric ? thisFabric.image : null,
-          fabricType: fabric,
-          printType: print,
-          qty: qty,
-          ratePerMeter: rate,
-          totalEstimate: rate ? rate * qty : null,
-          proposedPrice: propose ? parseFloat(propose) : null,
-          name, phone, email,
-          status: "pending",
-        };
-
-        // Save to Firestore
-        const { db, doc, setDoc } = window._fbMain;
-        setDoc(doc(db, 'queries', query.id), query).catch(e => console.error('Query save failed:', e));
-
-        // Reset upload zone for next use
-        clearPanelUpload(id);
-        setPanelMode(id, 'same');
-
-        toggleQuotePanel(id);
-        document.getElementById("success-ref").textContent = `Reference: ${query.id}`;
-        document.getElementById("successModal").classList.add("open");
+        const panelBtn = document.querySelector(`#qpanel-${id} .panel-submit-btn`) || document.querySelector('.panel-submit-btn');
+        try {
+          if (panelBtn) { panelBtn.disabled = true; panelBtn.textContent = '⏳ Submitting…'; }
+          await saveEnquiry(queryObj, uploadedDesign);
+          clearPanelUpload(id);
+          setPanelMode(id, 'same');
+          toggleQuotePanel(id);
+          document.getElementById("success-ref").textContent = `Reference: ${queryObj.id}`;
+          document.getElementById("successModal").classList.add("open");
+        } catch(e) {
+          console.error('submitPanelQuote error', e);
+          showToast('Submit failed — please try again', 'error');
+        } finally {
+          if (panelBtn) { panelBtn.disabled = false; panelBtn.textContent = '✦ Submit Quote Request'; }
+        }
       }
 
 
@@ -3429,7 +3456,7 @@
         const print = document.getElementById('custPrint').value;
         const fabric = document.getElementById('custFabric').value;
         const qty = parseFloat(document.getElementById('custQty').value) || 0;
-        const pricing = getPricing();
+        const pricing = _pricingCache;
         const rate = pricing[print + ':' + fabric] || pricing[print + ':all'] || pricing[print] || null;
         const box = document.getElementById('custPriceCalc');
 
@@ -3452,7 +3479,7 @@
         custProposeCalc();
       }
 
-      function submitCustomOrder() {
+      async function submitCustomOrder() {
         try {
           const name = (document.getElementById('custName').value || '').trim();
           const phone = (document.getElementById('custPhone').value || '').trim();
@@ -3486,14 +3513,14 @@
           if (!fabric) { showToast('Please select fabric type', 'error'); return; }
           if (!isUnlimited && (!qty || qty < 1)) { showToast('Please enter quantity (minimum 1 meter)', 'error'); return; }
 
-          const pricing = getPricing();
+          const pricing = _pricingCache;
           const rate = pricing[print + ':' + fabric] || pricing[print + ':all'] || pricing[print] || null;
           const finalQty = isUnlimited ? null : qty;
 
-          const query = {
-            id: genRef(), type: 'custom-order', timestamp: new Date().toISOString(),
+          const queryObj = {
+            id: genRef(), type: 'custom-design', timestamp: new Date().toISOString(),
             name, phone, printType: print, fabricType: fabric,
-            qty: finalQty, unlimited: isUnlimited, desc,
+            qty: finalQty, unlimited: isUnlimited, description: desc,
             ratePerMeter: rate,
             totalEstimate: (rate && !isUnlimited) ? rate * qty : null,
             proposedPrice: propose ? parseFloat(propose) : null,
@@ -3502,16 +3529,20 @@
             status: 'pending'
           };
 
+          const custBtn = document.querySelector('.btn-primary-light');
+          if (custBtn) { custBtn.disabled = true; custBtn.textContent = '⏳ Submitting…'; }
           try {
-            const { db, doc, setDoc } = window._fbMain;
-            setDoc(doc(db, 'queries', query.id), query).catch(e => console.error('Query save failed:', e));
-          } catch(storageErr) {
-            console.warn('Firestore save failed:', storageErr);
+            await saveEnquiry(queryObj, custUploadedImageSrc);
+          } catch(saveErr) {
+            console.error('saveEnquiry custom error:', saveErr);
+            if (custBtn) { custBtn.disabled = false; custBtn.textContent = '✦ Submit Custom Order Request'; }
+            showToast('Submit failed — please try again', 'error');
+            return;
           }
 
           // Reset form
-          ['custName','custPhone','custDesc','custPropose'].forEach(id => {
-            const el = document.getElementById(id);
+          ['custName','custPhone','custDesc','custPropose'].forEach(fId => {
+            const el = document.getElementById(fId);
             if (el) el.value = '';
           });
           const custPrintEl = document.getElementById('custPrint');
@@ -3529,16 +3560,34 @@
           if (rollAnim) rollAnim.style.display = 'none';
           resetCustUpload();
 
-          document.getElementById('success-ref').textContent = 'Reference: ' + query.id;
+          document.getElementById('success-ref').textContent = 'Reference: ' + queryObj.id;
           document.getElementById('successModal').classList.add('open');
         } catch(err) {
           console.error('submitCustomOrder error:', err);
           showToast('Something went wrong. Please try again.', 'error');
+        } finally {
+          const custBtnF = document.querySelector('.btn-primary-light');
+          if (custBtnF) { custBtnF.disabled = false; custBtnF.textContent = '✦ Submit Custom Order Request'; }
         }
       }
 
             // ─── INIT ───
-      renderFabrics();
+      onFbReady(() => {
+        // Load pricing and fabrics, then render
+        getPricing().then(() => renderFabrics());
+      });
+
+      // Re-render if fabrics change (Firestore real-time listener)
+      onFbReady(() => {
+        const { db, collection, onSnapshot, query, orderBy } = window._fb;
+        onSnapshot(query(collection(db, 'fabrics'), orderBy('updatedAt', 'desc')), snap => {
+          _fabricsCache = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => f.status === 'live');
+          renderFabrics();
+        });
+        onSnapshot(window._fb.doc(db, 'settings', 'pricing'), snap => {
+          if (snap.exists()) _pricingCache = snap.data().data || {};
+        });
+      });
 
       // ─── DESIGN MODE TOGGLE ───
       let currentMode = "upload";
@@ -3580,6 +3629,59 @@
       }
 
       // ─── UPLOAD MODE ───
+      // ─── IMAGE COMPRESSION UTILITY ───
+      // Max file size to accept for upload (5 MB). Files larger than this are rejected.
+      const MAX_UPLOAD_MB = 5;
+      // Target output size after compression (kept well under Firestore 1 MB doc limit).
+      const TARGET_COMPRESSED_KB = 800; // ~0.8 MB base64 ≈ ~600 KB binary
+
+      /**
+       * Compresses a dataURL image to a JPEG whose base64 size is under targetKB.
+       * Iteratively halves quality until the target is met or minimum quality reached.
+       * @param {string} dataUrl  – original image dataURL
+       * @param {number} maxDim   – max width or height in px (default 1600)
+       * @param {number} targetKB – target base64 size in KB (default TARGET_COMPRESSED_KB)
+       * @returns {Promise<string>} compressed JPEG dataURL
+       */
+      function compressImage(dataUrl, maxDim = 1600, targetKB = TARGET_COMPRESSED_KB) {
+        return new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => {
+            let w = img.width, h = img.height;
+            // Resize so the longest side ≤ maxDim
+            if (w > maxDim || h > maxDim) {
+              if (w >= h) { h = Math.round(h * maxDim / w); w = maxDim; }
+              else        { w = Math.round(w * maxDim / h); h = maxDim; }
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+            let quality = 0.82;
+            let result  = canvas.toDataURL('image/jpeg', quality);
+
+            // If still too big, reduce quality iteratively
+            while (result.length > targetKB * 1024 * 1.37 && quality > 0.25) {
+              quality = Math.max(quality - 0.10, 0.25);
+              result  = canvas.toDataURL('image/jpeg', quality);
+            }
+
+            // If still oversized at minimum quality, scale down the canvas by 75 % and retry
+            if (result.length > targetKB * 1024 * 1.37) {
+              const c2 = document.createElement('canvas');
+              c2.width  = Math.round(w * 0.75);
+              c2.height = Math.round(h * 0.75);
+              c2.getContext('2d').drawImage(canvas, 0, 0, c2.width, c2.height);
+              result = c2.toDataURL('image/jpeg', 0.72);
+            }
+
+            resolve(result);
+          };
+          img.onerror = () => resolve(dataUrl); // fallback: return original
+          img.src = dataUrl;
+        });
+      }
+
       function handleFileUpload(event) {
         const file = event.target.files[0];
         if (!file) return;
@@ -3589,10 +3691,19 @@
           document.getElementById("upload-error").style.display = "block";
           return;
         }
+        // Reject files larger than MAX_UPLOAD_MB
+        if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+          document.getElementById("upload-error").textContent =
+            `⚠ Image is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Please upload an image under ${MAX_UPLOAD_MB} MB.`;
+          document.getElementById("upload-error").style.display = "block";
+          return;
+        }
         document.getElementById("upload-error").style.display = "none";
         const reader = new FileReader();
-        reader.onload = (e) => {
-          uploadedImageSrc = e.target.result;
+        reader.onload = async (e) => {
+          // Compress before storing so Firestore docs stay well under 1 MB
+          const compressed = await compressImage(e.target.result);
+          uploadedImageSrc = compressed;
           document.getElementById("upload-preview-img").src = uploadedImageSrc;
           document.getElementById("upload-drop-zone").style.display = "none";
           document.getElementById("upload-preview-box").style.display = "block";
@@ -3616,6 +3727,12 @@
           dropZone.classList.remove("dragover");
           const file = e.dataTransfer.files[0];
           if (file && file.type.startsWith("image/")) {
+            if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+              document.getElementById("upload-error").textContent =
+                `⚠ Image is too large (${(file.size/1024/1024).toFixed(1)} MB). Please upload an image under ${MAX_UPLOAD_MB} MB.`;
+              document.getElementById("upload-error").style.display = "block";
+              return;
+            }
             const fakeEvent = { target: { files: [file] } };
             handleFileUpload(fakeEvent);
           }
@@ -3824,7 +3941,7 @@
         const qty = isUnlimited ? Infinity :
           (parseFloat(document.getElementById("ai-ord-qty").value) || 0);
         const fabricType = document.getElementById("ai-ord-fabric").value;
-        const pricing = getPricing();
+        const pricing = _pricingCache;
         const rate = pricing[printType+':'+fabricType] || pricing[printType+':all'] || pricing[printType];
         const calc = document.getElementById("ai-price-calc");
 
@@ -3882,7 +3999,7 @@
         }
       }
 
-      function submitAIOrder() {
+      async function submitAIOrder() {
         const name = document.getElementById("ai-ord-name").value.trim();
         const phone = document.getElementById("ai-ord-phone").value.trim();
         const designName = document
@@ -3935,12 +4052,11 @@
           return;
         }
 
-        const pricing = getPricing();
-        const rate = pricing[print] || null;
+        const pricing = _pricingCache;
+        const rate = pricing[print+':'+fabric] || pricing[print+':all'] || pricing[print] || null;
         const propose = document.getElementById("ai-ord-propose").value;
 
         // ── Build the full image data URL ──
-        // Prefer uploadedImageSrc (has correct MIME type); fall back to aiGeneratedImageB64
         let designImageSrc = null;
         if (uploadedImageSrc) {
           designImageSrc = uploadedImageSrc;
@@ -3948,7 +4064,7 @@
           designImageSrc = "data:image/jpeg;base64," + aiGeneratedImageB64;
         }
 
-        const query = {
+        const queryObj = {
           id: genRef(),
           type: "ai-design",
           timestamp: new Date().toISOString(),
@@ -3966,13 +4082,18 @@
           status: "pending",
         };
 
-        // Save query to Firestore
-        const { db, doc, setDoc } = window._fbMain;
-        setDoc(doc(db, 'queries', query.id), query).catch(e => console.error('Query save failed:', e));
-
-        document.getElementById("success-ref").textContent =
-          `Reference: ${query.id}`;
-        document.getElementById("successModal").classList.add("open");
+        const aiBtn = document.querySelector('.ai-submit-btn');
+        try {
+          if (aiBtn) { aiBtn.disabled = true; aiBtn.textContent = '⏳ Submitting…'; }
+          await saveEnquiry(queryObj, designImageSrc);
+          document.getElementById("success-ref").textContent = `Reference: ${queryObj.id}`;
+          document.getElementById("successModal").classList.add("open");
+        } catch(err) {
+          console.error('submitAIOrder error:', err);
+          showToast('Something went wrong. Please try again.', 'error');
+        } finally {
+          if (aiBtn) { aiBtn.disabled = false; aiBtn.textContent = '✦ Submit Order Request'; }
+        }
       }
 
       // ─── CUSTOM DESIGN ORDER: Auto-fetch from AI Studio ───
@@ -4664,10 +4785,14 @@
       function handleCustUpload(event) {
         const file = event.target.files[0];
         if (!file || !file.type.startsWith('image/')) return;
+        if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+          showToast(`Image too large (${(file.size/1024/1024).toFixed(1)} MB). Please upload under ${MAX_UPLOAD_MB} MB.`, 'error');
+          return;
+        }
         custUploadedFileName = file.name;
         const reader = new FileReader();
-        reader.onload = (e) => {
-          custUploadedImageSrc = e.target.result;
+        reader.onload = async (e) => {
+          custUploadedImageSrc = await compressImage(e.target.result);
           showCustPreview(custUploadedImageSrc, custUploadedFileName);
         };
         reader.readAsDataURL(file);
@@ -4680,10 +4805,14 @@
         dz.style.background = 'rgba(255,255,255,0.04)';
         const file = event.dataTransfer.files[0];
         if (!file || !file.type.startsWith('image/')) return;
+        if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+          showToast(`Image too large (${(file.size/1024/1024).toFixed(1)} MB). Please upload under ${MAX_UPLOAD_MB} MB.`, 'error');
+          return;
+        }
         custUploadedFileName = file.name;
         const reader = new FileReader();
-        reader.onload = (e) => {
-          custUploadedImageSrc = e.target.result;
+        reader.onload = async (e) => {
+          custUploadedImageSrc = await compressImage(e.target.result);
           showCustPreview(custUploadedImageSrc, custUploadedFileName);
         };
         reader.readAsDataURL(file);
@@ -4714,7 +4843,7 @@
         const prt   = document.getElementById('pn-print-' + id).value;
         const bd    = document.getElementById('pn-propose-breakdown-' + id);
         if (!offer || offer <= 0 || !bd) { if (bd) bd.style.display = 'none'; return; }
-        const pricing = getPricing();
+        const pricing = _pricingCache;
         const adminRate = pricing[prt+':'+fab] || pricing[prt+':all'] || pricing[prt] || null;
         if (!adminRate) { bd.style.display = 'none'; return; }
         const disc = ((adminRate - offer) / adminRate * 100);
@@ -4745,7 +4874,7 @@
         const fab   = document.getElementById('custFabric').value;
         const bd    = document.getElementById('cust-propose-breakdown');
         if (!offer || offer <= 0) { bd.style.display = 'none'; return; }
-        const pricing = getPricing();
+        const pricing = _pricingCache;
         const adminRate = pricing[prt+':'+fab] || pricing[prt+':all'] || pricing[prt] || null;
         if (!adminRate) { bd.style.display = 'none'; return; }
         const disc = ((adminRate - offer) / adminRate * 100);
